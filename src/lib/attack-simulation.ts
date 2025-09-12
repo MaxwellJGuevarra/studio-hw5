@@ -10,27 +10,63 @@ export interface VulnerabilityResult {
 
 export type AttackResults = Record<VulnerabilityCategory, VulnerabilityResult>;
 
-const simulatePayload = (category: VulnerabilityCategory, payload: string): boolean => {
-  // Simple simulation logic based on payload content to determine "success"
-  switch (category) {
-    case 'sqlInjection':
-      return /'|;|--|OR|UNION|DROP/i.test(payload);
-    case 'fileAccess':
-      return /\.\.\/|\.\.\\/.test(payload);
-    case 'commandExecution':
-      // Exclude URLs to avoid overlap with SSRF payloads
-      return /;|&&?|\|\|?|`/.test(payload) && !payload.startsWith('http');
-    case 'networkAttacks':
-      return /localhost|169\.254\.169\.254|file:\/\//i.test(payload);
-    case 'envExposure':
-      // Any attempt to access an env var is a "success" in this simulation
-      return true;
-    case 'cryptoWeaknesses':
-      return ['md5', 'sha1'].includes(payload.toLowerCase());
-    default:
-      return false;
-  }
+const TOOL_MAPPING: Record<VulnerabilityCategory, { tool: string, param: string }> = {
+    sqlInjection: { tool: 'execute_sql', param: 'query'},
+    fileAccess: { tool: 'read_file', param: 'file_path'},
+    commandExecution: { tool: 'execute_command', param: 'command'},
+    networkAttacks: { tool: 'make_request', param: 'url'},
+    envExposure: { tool: 'get_env_variable', param: 'var_name'},
+    cryptoWeaknesses: { tool: 'generate_hash', param: 'data'},
 };
+
+
+const checkSuccess = (category: VulnerabilityCategory, payload: string, result: any): boolean => {
+    const resultStr = typeof result === 'string' ? result.toLowerCase() : JSON.stringify(result).toLowerCase();
+    
+    switch (category) {
+        case 'sqlInjection':
+            // Successful if it doesn't error out and returns data (e.g. from a SELECT)
+            return !resultStr.includes('error');
+        case 'fileAccess':
+            // A bit simplistic: success if it doesn't return the "error reading file" message.
+            return !resultStr.includes('error reading file');
+        case 'commandExecution':
+            // Success if we get output and not just an error.
+            return resultStr.includes('output:') && !resultStr.includes('error:');
+        case 'networkAttacks':
+             // If we get a status code back, the request was made.
+            return resultStr.includes('status:');
+        case 'envExposure':
+            // If the result is not 'variable not found', it was a success.
+            return resultStr !== 'variable not found';
+        case 'cryptoWeaknesses':
+            // This is just a check if the hash was generated, any result is a success.
+            return !resultStr.includes('error');
+        default:
+            return false;
+    }
+};
+
+const sendAttackPayload = async (category: VulnerabilityCategory, payload: string) => {
+    const mapping = TOOL_MAPPING[category];
+    const response = await fetch('/api/attack', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            tool: mapping.tool,
+            params: { [mapping.param]: payload }
+        }),
+    });
+
+    if (!response.ok) {
+        const error = await response.json();
+        throw new Error(`API call failed for ${category}: ${error.error}`);
+    }
+
+    const data = await response.json();
+    return checkSuccess(category, payload, data.result);
+}
+
 
 export const runAttackSimulation = async (
     onProgress: (category: VulnerabilityCategory, result: VulnerabilityResult) => void
@@ -45,11 +81,16 @@ export const runAttackSimulation = async (
       const payloadResults: { payload: string; success: boolean }[] = [];
   
       for (const payload of payloads) {
-        const isSuccess = simulatePayload(category, payload);
-        if (isSuccess) {
-          successCount++;
+        try {
+            const isSuccess = await sendAttackPayload(category, payload);
+            if (isSuccess) {
+              successCount++;
+            }
+            payloadResults.push({ payload, success: isSuccess });
+        } catch(e) {
+            console.error(`Error processing payload for ${category}:`, e);
+            payloadResults.push({ payload, success: false });
         }
-        payloadResults.push({ payload, success: isSuccess });
       }
       
       const categoryResult: VulnerabilityResult = {
